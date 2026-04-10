@@ -4,123 +4,146 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-ESP32-S3 PlatformIO project for a DIY always-on dashcam. Unified codebase that auto-detects which hardware platform it's running on at boot via I2C probing.
+ESP32-S3 dashcam firmware for the Waveshare ESP32-S3-Touch-LCD-3.5B-C board. Continuous MJPEG AVI video recording with live LCD preview.
 
-**Status:** Phase 1 scaffolding complete — awaiting hardware for bring-up
+**Status:** v0.6 — Continuous MJPEG recording, dual-core architecture, working on hardware (2026-04-10)
 **Framework:** Arduino via PlatformIO
 
-## Hardware Platforms
+## Hardware — Waveshare ESP32-S3-Touch-LCD-3.5B-C
 
-### Platform A — Seeed XIAO ESP32S3 Sense (Prototype / Rear Camera)
-- **MCU:** ESP32-S3R8 (240MHz, 8MB PSRAM, 8MB Flash)
-- **Camera:** OV2640 (detachable), max 1600x1200
-- **Audio:** Onboard PDM microphone
-- **Storage:** MicroSD (SPI)
-- **No display** — headless operation
+- **MCU:** ESP32-S3R8 (240MHz, 8MB OPI PSRAM, 16MB Flash)
+- **Camera:** OV5640 5MP autofocus (DVP interface)
+- **Display:** 3.5" IPS 320x480, QSPI AXS15231B controller
+- **PMIC:** AXP2101 (LiPo charging, BLDO1/BLDO2 power rails)
+- **IO Expander:** TCA9554 at 0x20 (LCD reset on P1)
+- **SD:** SD_MMC 1-bit mode (CLK=11, CMD=10, D0=9) — FAT32 only, not exFAT
+- **Audio:** ES8311 codec (not used yet)
+- **RTC:** PCF85063 (not used yet)
+- **IMU:** QMI8658 (not used yet)
+- **Button:** BOOT (GPIO 0)
 
-### Platform B — Waveshare ESP32-S3-Touch-LCD-3.5B-C (Primary Unit)
-- **MCU:** ESP32-S3R8 (240MHz, 8MB PSRAM, 16MB Flash)
-- **Camera:** OV5640 5MP autofocus
-- **Display:** 3.5" IPS capacitive touch, 320x480, QSPI (AXS15231B)
-- **Audio:** ES8311 codec
-- **RTC:** PCF85063 (battery-backed)
-- **IMU:** QMI8658 (accelerometer + gyroscope)
-- **PMIC:** AXP2101
+### Critical Hardware Details (VERIFIED)
 
-### I2C Device Addresses
-- AXP2101 PMU: 0x34
-- ES8311 Audio: 0x18
-- PCF85063 RTC: 0x51
-- QMI8658 IMU: 0x6B
+- **PMU must init before camera**: AXP2101 BLDO1(1.5V) + BLDO2(2.8V) power the OV5640
+- **Canvas rotation MUST be 0**: Direct framebuffer writes only work with rotation=0. Rotation=1 only affects drawPixel/text, not buffer access. The QSPI flush breaks with MADCTL MV bit.
+- **Camera byte order**: DVP outputs big-endian RGB565. Canvas expects little-endian. Byte swap `(px >> 8) | (px << 8)` required for raw RGB565.
+- **JPEG decode byte order**: `fmt2rgb888` outputs BGR888 (not RGB). TJpgDec ROM outputs RGB888 (standard).
+- **Camera orientation**: DVP wiring naturally transposes — no software rotation needed. VGA (640x480) center-crop to 320x480 fills the portrait display.
+- **Sensor vflip**: `set_vflip(s, 1)` required after every camera init for correct orientation.
+- **SD_MMC 1-bit mode**: `SD_MMC.begin("/sdcard", true)` — the `true` flag is critical.
+- **PSRAM bus contention**: Both cores share one OPI PSRAM bus. JPEG decode on Core 0 slows 2-4x when Core 1 is actively writing AVI frames. Mitigated by copying JPEG to SRAM before decode.
 
-## Build Commands
+## Architecture (v0.6)
+
+### Dual-Core FreeRTOS Design
+
+| Core | Task | Priority | What It Does |
+|------|------|----------|--------------|
+| Core 0 | Main loop | 1 | JPEG decode → LCD preview + HUD overlay |
+| Core 1 | recordingTask | 2 | JPEG capture → MJPEG AVI files on SD |
+
+### Data Flow
+```
+Camera (JPEG VGA 8fps) → Core 1 → AVI file on SD (/DCIM/video/)
+                             ↓
+                     shared preview buffer (PSRAM, mutex-protected)
+                             ↓
+                     Core 0 → SRAM copy → TJpgDec decode → canvas → LCD
+```
+
+### MJPEG AVI Writer
+- Custom `AVIWriter` class writes valid RIFF AVI with MJPG codec
+- 1-minute segments: `REC_{uptime_seconds}.avi`
+- Headers patched on segment close (RIFF size, frame count, movi size)
+- Frame index (idx1) stored in PSRAM, written at close
+- Auto-cleanup: deletes oldest video when free space < 500MB
+
+### Preview Pipeline
+- TJpgDec from ESP32-S3 ROM — no library needed, `#include <rom/tjpgd.h>`
+- Two quality modes (toggled by button):
+  - **HQ (1/2 scale)**: 640x480 → 320x240, row-doubled to 320x480. ~2 FPS.
+  - **FAST (1/4 scale)**: 640x480 → 160x120, 2x horiz + 4x vert. ~4+ FPS.
+- JPEG source copied PSRAM → SRAM before decode to avoid bus contention
+- Work buffer in SRAM (not PSRAM) for decode performance
+
+### Button Functions
+| Action | How | What |
+|--------|-----|------|
+| Toggle preview quality | Single press | Switches between HQ (1/2) and FAST (1/4) scale |
+| Toggle recording | Double press | Pauses/resumes AVI recording (preview continues) |
+| Wipe SD card | Hold 3s, release, hold 3s again | Deletes all videos and photos |
+
+### HUD Overlay (3 rows, top of screen)
+1. Recording status: `REC 123 frm 8fps` / `PAUSED` / `STARTING...`
+2. Battery: `BAT 85% 4.12V CHG` or `USB PWR`
+3. Storage: `31.8GB 00:05:23` (free space + uptime)
+4. Bottom: `LCD:2fps HQ` (preview FPS + scale mode)
+
+## Build & Flash
 
 ```bash
-# PlatformIO path (if not in PATH)
-/c/Users/jchmiel/.platformio/penv/Scripts/pio.exe
-
-# Build for XIAO
-pio run -e xiao-s3
-
-# Build for Waveshare
-pio run -e waveshare-lcd35
-
-# Upload + monitor
-pio run -e xiao-s3 -t upload && pio device monitor
-pio run -e waveshare-lcd35 -t upload && pio device monitor
+cd tools/sd_reader
+pio run -t upload          # Build and flash (COM15)
+pio device monitor         # Serial monitor (115200)
 ```
 
-## Architecture
-
-### Hardware Abstraction Layer (HAL)
-- `HAL::instance()` singleton detects platform at boot via I2C probing
-- Each subsystem has a virtual interface with platform-specific implementations
-- `PlatformCaps` struct tracks which hardware is present
-- Check `hal.hasDisplay()`, `hal.hasIMU()` before using optional hardware
-
-### EventBus
-- Pub/sub system for decoupled inter-module communication
-- Button → BUTTON_PRESS → Recorder (protect clip)
-- IMU → IMPACT_DETECTED → Recorder (protect clip)
-- Double press → BUTTON_DOUBLE_PRESS → WiFi (toggle AP)
-- SD low → SD_SPACE_LOW → FileManager (cleanup)
-
-### Recording Pipeline
-- Camera → JPEG → MJPEGWriter (AVI container) → SD card
-- 1-minute segment files, named by timestamp
-- MJPEGWriter writes proper AVI RIFF headers
-- FileManager handles rotation and auto-cleanup at 80% SD usage
-
-### File Layout on SD
-```
-/DCAM/
-  /segments/    REC_YYYYMMDD_HHMMSS.avi  (auto-deleted oldest first)
-  /events/      EVT_YYYYMMDD_HHMMSS.avi  (protected, never auto-deleted)
-  /config/      settings.json
-  /log/         boot.log
+### platformio.ini Key Settings
+```ini
+platform = pioarduino (ESP32 v51.03.07)
+board = esp32-s3-devkitc-1
+board_build.arduino.memory_type = qio_opi
+board_build.flash_size = 16MB
+board_build.psram_type = opi
+build_flags = -DARDUINO_USB_CDC_ON_BOOT=1 -DBOARD_HAS_PSRAM -O2
+lib_deps = GFX Library for Arduino@1.5.0, XPowersLib@^0.2.6
 ```
 
-### Single Button
-- Press (<300ms): Mark event — protect current + previous clip
-- Double press: Toggle WiFi AP
-- Long press (>3s): Enter/exit standby
+### Serial Monitor Notes
+- USB CDC resets on DTR toggle — use `DtrEnable = $false` when reading without reset
+- Boot messages: PMU OK → Display OK → SD OK → PSRAM → Camera → Recording
+- Periodic: `[LCD] 2.1 fps (dec=392ms) | [REC] 7.9 fps | scale=1`
+- Segment transitions: `[REC] Segment done: 474 frames, 7.9 FPS avg`
+
+## File Layout on SD Card
+```
+/DCIM/
+  /video/     REC_7.avi, REC_67.avi, ...  (1-min MJPEG segments)
+  /photos/    (reserved for future use)
+```
 
 ## Key Files
 ```
-platformio.ini              — Dual build environments (xiao-s3, waveshare-lcd35)
-include/config.h            — All constants and thresholds
-include/pins_xiao.h         — XIAO pin map
-include/pins_waveshare.h    — Waveshare pin map (TBD placeholders)
-include/hal/HAL.h           — Central singleton, platform detection
-include/hal/Platform.h      — Detection logic, capabilities struct
-include/core/EventBus.h     — Event system (fully implemented)
-include/recording/MJPEGWriter.h  — AVI file writer (fully implemented)
-include/recording/Recorder.h     — Recording state machine
-include/input/ButtonHandler.h    — Multi-function button (fully implemented)
-include/storage/FileManager.h    — File naming, rotation, cleanup
-include/network/WiFiAP.h        — Wi-Fi AP management
-include/network/WebServer.h     — HTTP clip browser
-src/main.cpp                     — Entry point and main loop
+tools/sd_reader/src/main.cpp       — THE firmware (single file, ~800 lines)
+tools/sd_reader/platformio.ini     — Build config
+tools/format_fat32.bat             — Format SD as FAT32 (diskpart)
+tools/format_fat32.ps1             — Format SD as FAT32 (PowerShell)
+CLAUDE.md                          — This file
 ```
 
-## Libraries
-- `lewisxhe/XPowersLib` — AXP2101 PMIC driver
-- `lewisxhe/SensorLib` — QMI8658 IMU driver
-- `jchmiel123/esp32-i2c-bus` — I2C bus management
-- `moononournation/GFX Library for Arduino` — Display (Waveshare only)
+## Performance Characteristics
+| Metric | Value |
+|--------|-------|
+| Recording FPS | 7.4–7.9 (target 8) |
+| Preview FPS (HQ) | 1–2 FPS |
+| Preview FPS (FAST) | 3–5 FPS (estimated) |
+| JPEG decode time | 400–1600ms (varies with PSRAM contention) |
+| AVI segment size | ~18MB/minute at VGA quality 12 |
+| Recording capacity | ~30 hours on 32GB FAT32 |
+| PSRAM free | ~7.7MB (of 8MB) |
+| SRAM free | ~300KB (of 320KB) |
+| Boot time | ~5 seconds |
 
-## Phase Status
-- [x] Phase 1: Project scaffolding, architecture, interfaces
-- [ ] Phase 2: Camera init + JPEG capture to SD (XIAO)
-- [ ] Phase 3: Continuous recording with file rotation (XIAO)
-- [ ] Phase 4: WiFi AP + HTTP file browser (XIAO)
-- [ ] Phase 5: Hardware detection + platform abstraction (Both)
-- [ ] Phase 6: RTC, IMU, display UI (Waveshare)
-- [ ] Phase 7: Power-loss detection + graceful shutdown (Both)
-- [ ] Phase 8: Timestamp overlay on frames (Both)
+## Known Limitations
+- **AVI not crash-safe**: Power loss mid-segment leaves headers unpatched (file unplayable). Could add periodic header flush.
+- **No RTC timestamps**: Filenames use `millis()` uptime, not real time. PCF85063 RTC is present but unused.
+- **No audio**: ES8311 codec available but not integrated.
+- **PSRAM bus contention**: Preview FPS varies 0.5–2.5 depending on SD write activity.
+- **Preview colors**: TJpgDec ROM outputs RGB; verified correct. If colors look wrong, the byte order in `jpgWriteCb` is the place to check.
 
-## Known TBDs
-- Waveshare pin mappings in `pins_waveshare.h` — need schematic verification
-- Display driver init in `DisplayHAL.h` — QSPI setup for AXS15231B
-- Audio implementations — ES8311 codec and PDM mic I2S setup
-- TimestampOverlay — currently passthrough, needs JPEG decode/encode
+## Future Phases
+- [ ] PCF85063 RTC integration for real timestamps
+- [ ] QMI8658 IMU for impact/G-force detection
+- [ ] ES8311 audio recording
+- [ ] WiFi AP + HTTP file browser for downloading clips
+- [ ] AVI crash recovery (periodic header flush)
+- [ ] Touch screen UI for playback/settings

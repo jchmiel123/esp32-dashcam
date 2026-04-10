@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+tools/capture.jpg
+tools/waveshare_demo/
+tools/ext4_results.txt
